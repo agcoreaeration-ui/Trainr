@@ -1,0 +1,18 @@
+name = "trainr-api"
+main = "src/index.js"
+compatibility_date = "2026-06-01"
+
+[[d1_databases]]
+binding = "DB"
+database_name = "trainr-db"
+database_id = "5cd14bf5-9f7a-4fae-a1dd-2e5b541a6fa4"
+
+# Runs the weekly review every Sunday at 20:00 UTC — adjust for your timezone
+# (AEST is UTC+10 / AEDT is UTC+11, so 20:00 UTC = 6am/7am Monday for you —
+#  pick a cron time that lands when you want, e.g. "0 10 * * 0" = 8pm AEST Sunday)
+[triggers]
+crons = ["0 10 * * 0"]
+
+# Secrets (set these with `wrangler secret put NAME`, don't put them in this file):
+#   ANTHROPIC_API_KEY
+#   INGEST_TOKEN   (a random string you also paste into your Shortcuts automation)
