@@ -7,7 +7,7 @@
  *  - INGEST_TOKEN: secret, shared token the Shortcuts automation sends to authenticate
  */
 
-const CLAUDE_MODEL = "claude-sonnet-4-6";
+const CLAUDE_MODEL = "claude-sonnet-5";
 
 function json(data, status = 200) {
   return new Response(JSON.stringify(data), {
@@ -26,7 +26,7 @@ function cors() {
   });
 }
 
-async function callClaude(env, systemPrompt, userPrompt) {
+async function callClaude(env, systemPrompt, userPrompt, maxTokens = 4000) {
   const res = await fetch("https://api.anthropic.com/v1/messages", {
     method: "POST",
     headers: {
@@ -36,7 +36,7 @@ async function callClaude(env, systemPrompt, userPrompt) {
     },
     body: JSON.stringify({
       model: CLAUDE_MODEL,
-      max_tokens: 4000,
+      max_tokens: maxTokens,
       system: systemPrompt,
       messages: [{ role: "user", content: userPrompt }],
     }),
@@ -96,8 +96,14 @@ ${JSON.stringify(recentRuns.results)}
 
 Generate the full week-by-week plan now as JSON only.`;
 
-  const raw = await callClaude(env, systemPrompt, userPrompt);
-  const plan = JSON.parse(stripJsonFence(raw));
+  const raw = await callClaude(env, systemPrompt, userPrompt, 16000);
+  let plan;
+  try {
+    plan = JSON.parse(stripJsonFence(raw));
+  } catch (e) {
+    console.error("Failed to parse plan JSON. Raw response was:", raw);
+    throw new Error("Claude returned invalid/incomplete JSON for the plan — see raw output in logs");
+  }
 
   // Persist
   const stmts = [];
@@ -165,8 +171,14 @@ ${JSON.stringify(upcoming.results)}
 
 Review and respond with JSON only.`;
 
-  const raw = await callClaude(env, systemPrompt, userPrompt);
-  const result = JSON.parse(stripJsonFence(raw));
+  const raw = await callClaude(env, systemPrompt, userPrompt, 2000);
+  let result;
+  try {
+    result = JSON.parse(stripJsonFence(raw));
+  } catch (e) {
+    console.error("Failed to parse review JSON. Raw response was:", raw);
+    throw new Error("Claude returned invalid/incomplete JSON for the review — see raw output in logs");
+  }
 
   for (const adj of result.adjustments || []) {
     await env.DB.prepare(
@@ -252,7 +264,14 @@ async function handlePlanCurrent(env) {
   const plan = await env.DB.prepare(
     `SELECT tp.* FROM training_plan tp
      JOIN goals g ON g.id = tp.goal_id
-     WHERE g.status = 'active' AND tp.week_start_date <= date('now') AND tp.week_start_date > date('now', '-7 days')
+     WHERE g.status = 'active'
+     AND tp.week_start_date = (
+       SELECT tp2.week_start_date FROM training_plan tp2
+       JOIN goals g2 ON g2.id = tp2.goal_id
+       WHERE g2.status = 'active'
+       ORDER BY ABS(julianday(tp2.week_start_date) - julianday('now'))
+       LIMIT 1
+     )
      ORDER BY tp.day_of_week`
   ).all();
   return json(plan.results);
@@ -295,6 +314,7 @@ export default {
 
       return json({ error: "not found" }, 404);
     } catch (err) {
+      console.error(err);
       return json({ error: err.message }, 500);
     }
   },
