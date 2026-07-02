@@ -1,6 +1,6 @@
 import React, { useEffect, useState, useCallback } from "react";
 
-const API_BASE = "https://trainr-api.agcoreaeration.workers.dev";
+const API_BASE = ""; // same-origin in prod behind Cloudflare Pages, proxied in dev
 
 const SESSION_LABEL = {
   easy: "Easy",
@@ -76,23 +76,35 @@ function WeekPlan({ sessions }) {
       </div>
     );
   }
+  const todayAbbr = DAY_ORDER[(new Date().getDay() + 6) % 7]; // JS getDay(): Sun=0 -> map to MON..SUN
   return (
     <div className="week-plan">
-      {sorted.map((s) => (
-        <div key={s.id} className={`week-plan__row week-plan__row--${s.session_type}`}>
-          <div className="week-plan__lane" />
-          <div className="week-plan__day">{s.day_of_week}</div>
-          <div className="week-plan__info">
-            <div className="week-plan__type">{SESSION_LABEL[s.session_type] || s.session_type}</div>
-            <div className="week-plan__desc">{s.description}</div>
+      {sorted.map((s) => {
+        const isToday = s.day_of_week === todayAbbr;
+        return (
+          <div
+            key={s.id}
+            className={`week-plan__row week-plan__row--${s.session_type} ${
+              isToday ? "week-plan__row--today" : ""
+            }`}
+          >
+            <div className="week-plan__lane" />
+            <div className="week-plan__day">
+              {s.day_of_week}
+              {isToday && <span className="week-plan__today-badge">TODAY</span>}
+            </div>
+            <div className="week-plan__info">
+              <div className="week-plan__type">{SESSION_LABEL[s.session_type] || s.session_type}</div>
+              <div className="week-plan__desc">{s.description}</div>
+            </div>
+            <div className="week-plan__stats">
+              <span>{fmtDist(s.target_distance_km)}</span>
+              <span className="week-plan__pace">{fmtPace(s.target_pace_min_per_km)}</span>
+            </div>
+            <div className={`week-plan__status week-plan__status--${s.status}`}>{s.status}</div>
           </div>
-          <div className="week-plan__stats">
-            <span>{fmtDist(s.target_distance_km)}</span>
-            <span className="week-plan__pace">{fmtPace(s.target_pace_min_per_km)}</span>
-          </div>
-          <div className={`week-plan__status week-plan__status--${s.status}`}>{s.status}</div>
-        </div>
-      ))}
+        );
+      })}
     </div>
   );
 }

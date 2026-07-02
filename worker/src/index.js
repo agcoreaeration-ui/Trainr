@@ -199,43 +199,77 @@ Review and respond with JSON only.`;
 
 // ---------- Route handlers ----------
 
+function haeQty(field) {
+  if (field == null) return null;
+  if (typeof field === "number") return field;
+  if (typeof field === "object" && typeof field.qty === "number") return field.qty;
+  return null;
+}
+
+function haeDateToIso(dateStr) {
+  // "2026-07-01 13:13:46 +1000" -> "2026-07-01T13:13:46+10:00"
+  if (!dateStr) return null;
+  const m = dateStr.match(/^(\d{4}-\d{2}-\d{2}) (\d{2}:\d{2}:\d{2}) ([+-]\d{2})(\d{2})$/);
+  if (!m) return dateStr;
+  return `${m[1]}T${m[2]}${m[3]}:${m[4]}`;
+}
+
 async function handleIngest(req, env) {
   const auth = req.headers.get("Authorization") || "";
   if (auth !== `Bearer ${env.INGEST_TOKEN}`) {
     return json({ error: "unauthorized" }, 401);
   }
   const body = await req.json();
-  // Expected from Shortcuts: start_time, duration_sec, distance_km, avg_pace_min_per_km, avg_hr, max_hr, splits (array)
-  const result = await env.DB.prepare(
-    `INSERT INTO runs (start_time, duration_sec, distance_km, avg_pace_min_per_km, avg_hr, max_hr, splits_json)
-     VALUES (?,?,?,?,?,?,?)`
-  )
-    .bind(
-      body.start_time,
-      body.duration_sec ?? null,
-      body.distance_km ?? null,
-      body.avg_pace_min_per_km ?? null,
-      body.avg_hr ?? null,
-      body.max_hr ?? null,
-      JSON.stringify(body.splits ?? [])
+  const workouts = body?.data?.workouts || body?.workouts || (Array.isArray(body) ? body : []);
+
+  let inserted = 0;
+  let skipped = 0;
+
+  for (const w of workouts) {
+    const name = (w.name || "").toLowerCase();
+    if (!name.includes("run")) {
+      skipped++;
+      continue;
+    }
+
+    const distanceKm = haeQty(w.distance);
+    const durationSec = typeof w.duration === "number" ? Math.round(w.duration) : null;
+    const avgHr = haeQty(w.avgHeartRate);
+    const maxHr = haeQty(w.maxHeartRate);
+    const paceMinPerKm =
+      distanceKm && distanceKm > 0 && durationSec ? durationSec / 60 / distanceKm : null;
+    const startTime = haeDateToIso(w.start);
+    const externalId = w.id || null;
+
+    const result = await env.DB.prepare(
+      `INSERT OR IGNORE INTO runs
+       (start_time, duration_sec, distance_km, avg_pace_min_per_km, avg_hr, max_hr, splits_json, external_id)
+       VALUES (?,?,?,?,?,?,?,?)`
     )
-    .run();
+      .bind(startTime, durationSec, distanceKm, paceMinPerKm, avgHr, maxHr, "[]", externalId)
+      .run();
 
-  const runId = result.meta.last_row_id;
+    if (result.meta.changes > 0) {
+      inserted++;
+      const runId = result.meta.last_row_id;
+      const dayOnly = startTime ? startTime.slice(0, 10) : null;
+      if (dayOnly) {
+        await env.DB.prepare(
+          `UPDATE training_plan SET status = 'completed', run_id = ?
+           WHERE week_start_date <= ? AND status = 'planned'
+           AND date(week_start_date, '+' || (CASE day_of_week
+              WHEN 'MON' THEN 0 WHEN 'TUE' THEN 1 WHEN 'WED' THEN 2 WHEN 'THU' THEN 3
+              WHEN 'FRI' THEN 4 WHEN 'SAT' THEN 5 WHEN 'SUN' THEN 6 END) || ' days') = ?`
+        )
+          .bind(runId, dayOnly, dayOnly)
+          .run();
+      }
+    } else {
+      skipped++; // already existed (duplicate external_id)
+    }
+  }
 
-  // Try to match this run to a planned session for today
-  const today = new Date(body.start_time).toISOString().slice(0, 10);
-  await env.DB.prepare(
-    `UPDATE training_plan SET status = 'completed', run_id = ?
-     WHERE week_start_date <= ? AND status = 'planned'
-     AND date(week_start_date, '+' || (CASE day_of_week
-        WHEN 'MON' THEN 0 WHEN 'TUE' THEN 1 WHEN 'WED' THEN 2 WHEN 'THU' THEN 3
-        WHEN 'FRI' THEN 4 WHEN 'SAT' THEN 5 WHEN 'SUN' THEN 6 END) || ' days') = ?`
-  )
-    .bind(runId, today, today)
-    .run();
-
-  return json({ ok: true, run_id: runId });
+  return json({ ok: true, inserted, skipped, totalReceived: workouts.length });
 }
 
 async function handleGoalsList(env) {

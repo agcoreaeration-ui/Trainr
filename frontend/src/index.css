@@ -248,6 +248,31 @@ select:focus-visible {
   font-weight: 600;
 }
 
+.week-plan__row--today {
+  background: var(--lime-100);
+  border-radius: 8px;
+  margin: 0 -8px;
+  padding-left: 8px;
+  padding-right: 8px;
+}
+
+.week-plan__row--today .week-plan__lane {
+  box-shadow: 0 0 0 2px var(--teal-700);
+}
+
+.week-plan__today-badge {
+  display: block;
+  margin-top: 2px;
+  font-size: 9px;
+  font-weight: 700;
+  letter-spacing: 0.05em;
+  color: var(--teal-700);
+  background: var(--lime-400);
+  border-radius: 4px;
+  padding: 1px 4px;
+  text-align: center;
+}
+
 /* ---------- Recent runs ---------- */
 
 .runs-list__row {
