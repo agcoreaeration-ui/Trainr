@@ -1,6 +1,6 @@
 import React, { useEffect, useState, useCallback } from "react";
 
-const API_BASE = ""; // same-origin in prod behind Cloudflare Pages, proxied in dev
+const API_BASE = "https://trainr-api.agcoreaeration.workers.dev";
 
 const SESSION_LABEL = {
   easy: "Easy",
