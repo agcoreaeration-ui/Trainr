@@ -54,14 +54,124 @@ function stripJsonFence(text) {
   return text.replace(/```json\s*|```\s*/g, "").trim();
 }
 
+const WORKERS_AI_MODEL = "@cf/meta/llama-3.3-70b-instruct-fp8-fast";
+
+// Llama does the heavy lifting (free, within Workers AI's daily quota) — full plan
+// generation and weekly analysis both go through here, with JSON Mode enforcing
+// a schema so we don't get the "invalid JSON" failures we used to get from free-text output.
+async function callWorkersAI(env, systemPrompt, userPrompt, jsonSchema, maxTokens = 4096) {
+  const attempt = async () => {
+    const response = await env.AI.run(WORKERS_AI_MODEL, {
+      messages: [
+        { role: "system", content: systemPrompt },
+        { role: "user", content: userPrompt },
+      ],
+      response_format: { type: "json_schema", json_schema: jsonSchema },
+      max_tokens: maxTokens,
+    });
+    let raw = response?.response ?? response;
+    if (typeof raw === "string") {
+      return JSON.parse(stripJsonFence(raw));
+    }
+    return raw;
+  };
+
+  // Workers AI occasionally throws transient internal/upstream errors — retry a
+  // couple of times with a short backoff before giving up, rather than failing
+  // the whole plan generation on a one-off platform blip.
+  const MAX_ATTEMPTS = 3;
+  let lastErr;
+  for (let i = 0; i < MAX_ATTEMPTS; i++) {
+    try {
+      return await attempt();
+    } catch (e) {
+      lastErr = e;
+      console.error(`Workers AI call failed (attempt ${i + 1}/${MAX_ATTEMPTS}):`, e.message);
+      if (i < MAX_ATTEMPTS - 1) {
+        await new Promise((resolve) => setTimeout(resolve, 1000 * (i + 1)));
+      }
+    }
+  }
+  throw new Error(`Workers AI (Llama) failed after ${MAX_ATTEMPTS} attempts: ${lastErr.message}`);
+}
+
+const PLAN_SCHEMA = {
+  type: "object",
+  properties: {
+    weeks: {
+      type: "array",
+      items: {
+        type: "object",
+        properties: {
+          week_number: { type: "integer" },
+          sessions: {
+            type: "array",
+            items: {
+              type: "object",
+              properties: {
+                day_of_week: { type: "string", enum: ["MON", "TUE", "WED", "THU", "FRI", "SAT", "SUN"] },
+                session_type: { type: "string", enum: ["easy", "tempo", "interval", "long", "rest", "race"] },
+                target_distance_km: { type: "number" },
+                target_pace_min_per_km: { type: "number" },
+                description: { type: "string" },
+              },
+              required: ["day_of_week", "session_type", "target_distance_km", "target_pace_min_per_km", "description"],
+            },
+          },
+        },
+        required: ["week_number", "sessions"],
+      },
+    },
+  },
+  required: ["weeks"],
+};
+
+const REVIEW_SCHEMA = {
+  type: "object",
+  properties: {
+    feedback_draft: { type: "string" },
+    adjustments: {
+      type: "array",
+      items: {
+        type: "object",
+        properties: {
+          training_plan_id: { type: "integer" },
+          target_distance_km: { type: "number" },
+          target_pace_min_per_km: { type: "number" },
+          description: { type: "string" },
+        },
+        required: ["training_plan_id"],
+      },
+    },
+  },
+  required: ["feedback_draft", "adjustments"],
+};
+
 // ---------- Plan generation ----------
 
 async function generatePlan(env, goal) {
-  const today = new Date();
-  const targetDate = goal.target_date ? new Date(goal.target_date) : null;
-  const weeksRemaining = targetDate
-    ? Math.max(4, Math.round((targetDate - today) / (7 * 24 * 60 * 60 * 1000)))
-    : 8;
+  const today = todayMelbourne();
+  const targetDate = goal.target_date ? new Date(goal.target_date + "T00:00:00Z") : null;
+
+  const RACE_DISTANCE_KM = { "5k": 5, "10k": 10, half: 21.1, full: 42.2 };
+
+  // Compute exactly which week_number and day_of_week the race actually falls on,
+  // by comparing calendar Mondays — deterministic, not left for the AI to calculate
+  // (LLMs are unreliable at multi-step date arithmetic, especially split across chunks).
+  let weeksRemaining;
+  let raceWeekNumber = null;
+  let raceDayOfWeek = null;
+  if (targetDate) {
+    const planStartMonday = mondayOf(today);
+    const targetMonday = mondayOf(targetDate);
+    const weeksBetweenMondays = Math.round((targetMonday - planStartMonday) / (7 * 24 * 60 * 60 * 1000));
+    raceWeekNumber = Math.max(1, weeksBetweenMondays + 1);
+    raceDayOfWeek = ["SUN", "MON", "TUE", "WED", "THU", "FRI", "SAT"][targetDate.getUTCDay()];
+    weeksRemaining = Math.max(4, raceWeekNumber);
+  } else {
+    weeksRemaining = 8;
+  }
+  const raceDistanceKm = RACE_DISTANCE_KM[goal.type] ?? null;
 
   // Pull recent run history for context on current fitness
   const recentRuns = await env.DB.prepare(
@@ -69,55 +179,125 @@ async function generatePlan(env, goal) {
      FROM runs ORDER BY start_time DESC LIMIT 20`
   ).all();
 
-  const systemPrompt = `You are an experienced running coach. You write structured, safe, progressive training plans.
-Always respond with ONLY valid JSON, no markdown fences, no preamble, matching this schema:
-{
-  "weeks": [
-    {
-      "week_number": 1,
-      "week_start_date": "YYYY-MM-DD",
-      "sessions": [
-        { "day_of_week": "MON", "session_type": "easy|tempo|interval|long|rest|race",
-          "target_distance_km": 5.0, "target_pace_min_per_km": 6.0, "description": "short human description" }
-      ]
-    }
-  ]
-}
-Follow standard periodization: base, build, peak, taper. Respect the runner's current fitness from their recent run history — don't prescribe volume they haven't earned. Include rest/easy days between hard sessions. If target_date implies a taper is needed, include one.`;
+  const todayDow = ["SUN", "MON", "TUE", "WED", "THU", "FRI", "SAT"][today.getDay()];
+  const remainingDaysThisWeek = ["MON", "TUE", "WED", "THU", "FRI", "SAT", "SUN"].slice(
+    ["MON", "TUE", "WED", "THU", "FRI", "SAT", "SUN"].indexOf(todayDow)
+  );
 
-  const userPrompt = `Goal: ${goal.type} on ${goal.target_date || "no fixed date"}, target time: ${
-    goal.target_time || "none specified"
-  }.
-Weeks available: ${weeksRemaining}.
-Plan should start the week of: ${today.toISOString().slice(0, 10)}.
+  // Generate a few weeks at a time rather than the whole plan in one call — a full
+  // 12-14 week structured/schema-validated response is slow enough to hit Workers AI's
+  // internal request timeout. Smaller chunks finish comfortably and get stitched together.
+  const CHUNK_SIZE = 4;
+  const allWeeks = [];
+  let progressSoFar = "This is the first chunk — no prior weeks generated yet.";
 
-Recent run history (most recent first, may be sparse):
+  for (let chunkStart = 1; chunkStart <= weeksRemaining; chunkStart += CHUNK_SIZE) {
+    const chunkEnd = Math.min(chunkStart + CHUNK_SIZE - 1, weeksRemaining);
+    const isFirstChunk = chunkStart === 1;
+
+    const weekConstraint = isFirstChunk
+      ? `Week 1 is a partial week starting today, not a full Monday-Sunday week. Week 1 must contain a session entry for EXACTLY these days, in this order, and no others: ${remainingDaysThisWeek.join(
+          ", "
+        )}. Do not include any day before today in week 1. Every other week in this batch (weeks ${chunkStart + 1}-${chunkEnd}) must be a complete Monday-through-Sunday week.`
+      : `Every week in this batch (weeks ${chunkStart}-${chunkEnd}) must be a complete Monday-through-Sunday week, all 7 days.`;
+
+    const raceInThisChunk = raceWeekNumber != null && raceWeekNumber >= chunkStart && raceWeekNumber <= chunkEnd;
+    const raceConstraint = raceInThisChunk
+      ? `CRITICAL — the race falls in week ${raceWeekNumber}, on ${raceDayOfWeek}, in THIS batch. Week ${raceWeekNumber} must include exactly one session with session_type "race" on ${raceDayOfWeek}${
+          raceDistanceKm ? ` with target_distance_km exactly ${raceDistanceKm}` : ""
+        }. This is the final week of the entire plan — do not generate any weeks after ${raceWeekNumber}. The days in week ${raceWeekNumber} before ${raceDayOfWeek} should be a short taper (easy/rest only, no hard sessions).`
+      : `Do not include any session with session_type "race" in this batch — the race is not in these weeks.`;
+
+    const systemPrompt = `You are an experienced running coach. You write structured, safe, progressive training plans, one batch of weeks at a time.
+Follow standard periodization: base, build, peak, taper. If the runner states their current weekly volume or fitness in the notes, trust that over sparse run history — don't default to a conservative "beginner" template just because logged history is thin. The peak long run across the whole plan should reach roughly 75-85% of the race distance (e.g. ~16-18km for a half marathon) unless the runner's notes indicate that's unsafe. Include rest/easy days between hard sessions, use a 3:1 build:recovery week pattern.
+
+${weekConstraint}
+${raceConstraint}
+Generate ONLY weeks with week_number ${chunkStart} through ${chunkEnd} — no other weeks.`;
+
+    const userPrompt = `Goal: ${goal.type} on ${goal.target_date || "no fixed date"}, target time: ${
+      goal.target_time || "none specified"
+    }.
+Total plan length: ${weeksRemaining} weeks (week ${raceWeekNumber ?? weeksRemaining} is race week). This batch covers weeks ${chunkStart}-${chunkEnd} only.
+Today is ${todayDow}, ${today.toISOString().slice(0, 10)}.
+
+Runner's own notes on current fitness (trust this over sparse logged history if they conflict):
+${goal.notes || "none provided"}
+
+Recent run history in Trainr (most recent first, may be sparse/incomplete — don't treat a short list as the runner's full fitness picture):
 ${JSON.stringify(recentRuns.results)}
 
-Generate the full week-by-week plan now as JSON only.`;
+Progress so far in this plan: ${progressSoFar}
 
-  const raw = await callClaude(env, systemPrompt, userPrompt, 16000);
-  let plan;
-  try {
-    plan = JSON.parse(stripJsonFence(raw));
-  } catch (e) {
-    console.error("Failed to parse plan JSON. Raw response was:", raw);
-    throw new Error("Claude returned invalid/incomplete JSON for the plan — see raw output in logs");
+Generate weeks ${chunkStart}-${chunkEnd} now.`;
+
+    const chunkPlan = await callWorkersAI(env, systemPrompt, userPrompt, PLAN_SCHEMA);
+    if (!chunkPlan || !Array.isArray(chunkPlan.weeks) || chunkPlan.weeks.length === 0) {
+      throw new Error(`Llama returned an empty or malformed plan for weeks ${chunkStart}-${chunkEnd}`);
+    }
+    allWeeks.push(...chunkPlan.weeks);
+
+    const lastWeek = chunkPlan.weeks[chunkPlan.weeks.length - 1];
+    const lastWeekKm = lastWeek.sessions.reduce((sum, s) => sum + (s.target_distance_km || 0), 0);
+    const lastWeekLong = Math.max(
+      0,
+      ...lastWeek.sessions.map((s) => (s.session_type === "long" ? s.target_distance_km : 0))
+    );
+    progressSoFar = `Through week ${lastWeek.week_number}: ~${lastWeekKm.toFixed(1)}km that week, longest run ${lastWeekLong.toFixed(
+      1
+    )}km. Continue progressing sensibly from there.`;
   }
 
-  // Persist
-  const stmts = [];
+  let plan = { weeks: allWeeks };
+
+  // Safety net — Llama doesn't always perfectly follow instructions. Force-correct
+  // two things we know deterministically from code: no race session outside the
+  // real race week, and no weeks generated past it.
+  if (raceWeekNumber != null) {
+    plan.weeks = plan.weeks
+      .filter((w) => w.week_number <= raceWeekNumber)
+      .map((w) => {
+        if (w.week_number === raceWeekNumber) return w;
+        // Not race week — demote any stray "race" session type to "long" so it doesn't
+        // silently vanish, just stops being mislabeled as the race.
+        return {
+          ...w,
+          sessions: w.sessions.map((s) => (s.session_type === "race" ? { ...s, session_type: "long" } : s)),
+        };
+      });
+  }
+
+  // Persist — delete any existing not-yet-run sessions for this goal and insert the
+  // fresh plan in ONE atomic batch, so two overlapping requests can't race each other.
+  const planStartMonday = mondayOf(today);
+
+  const existingCompleted = await env.DB.prepare(
+    `SELECT session_date FROM training_plan WHERE goal_id = ? AND status = 'completed'`
+  )
+    .bind(goal.id)
+    .all();
+  const completedDates = new Set(existingCompleted.results.map((r) => r.session_date));
+
+  const stmts = [
+    env.DB.prepare(`DELETE FROM training_plan WHERE goal_id = ? AND status = 'planned'`).bind(goal.id),
+  ];
   for (const week of plan.weeks) {
+    const weekMonday = addDays(planStartMonday, (week.week_number - 1) * 7);
+    const weekStartDateStr = toYMD(weekMonday);
     for (const s of week.sessions) {
+      const offset = DAY_OFFSET[s.day_of_week] ?? 0;
+      const sessionDateStr = toYMD(addDays(weekMonday, offset));
+      if (completedDates.has(sessionDateStr)) continue; // already actually run — don't overlay a planned duplicate
       stmts.push(
         env.DB.prepare(
           `INSERT INTO training_plan
-           (goal_id, week_number, week_start_date, day_of_week, session_type, target_distance_km, target_pace_min_per_km, description)
-           VALUES (?,?,?,?,?,?,?,?)`
+           (goal_id, week_number, week_start_date, session_date, day_of_week, session_type, target_distance_km, target_pace_min_per_km, description)
+           VALUES (?,?,?,?,?,?,?,?,?)`
         ).bind(
           goal.id,
           week.week_number,
-          week.week_start_date,
+          weekStartDateStr,
+          sessionDateStr,
           s.day_of_week,
           s.session_type,
           s.target_distance_km ?? null,
@@ -128,37 +308,76 @@ Generate the full week-by-week plan now as JSON only.`;
     }
   }
   await env.DB.batch(stmts);
+
+  // Small Claude pass: NOT the full plan, just a condensed per-week summary,
+  // so this stays a handful of cents at most rather than a full-plan-sized call.
+  try {
+    const weekSummaries = plan.weeks.map((w) => {
+      const totalKm = w.sessions.reduce((sum, s) => sum + (s.target_distance_km || 0), 0);
+      const longRun = Math.max(0, ...w.sessions.map((s) => (s.session_type === "long" ? s.target_distance_km : 0)));
+      return `Week ${w.week_number}: ${totalKm.toFixed(1)}km total, longest run ${longRun.toFixed(1)}km`;
+    });
+    const reviewPrompt = `A training plan was just drafted for a runner. Goal: ${goal.type} on ${
+      goal.target_date || "no fixed date"
+    }. Runner's notes: ${goal.notes || "none"}.
+
+Week-by-week summary:
+${weekSummaries.join("\n")}
+
+In 2-3 sentences, give a direct coach's take: confirm this looks appropriately scaled for the goal, or flag one specific concern (e.g. volume too low/high, peak long run too short relative to race distance, missing taper) if something looks off.`;
+    const coachNote = await callClaude(
+      env,
+      "You are a concise, direct running coach reviewing a colleague's drafted plan.",
+      reviewPrompt,
+      300
+    );
+    // A new plan replaces the old one, so its review should too — an old "plan review"
+    // describing numbers that no longer exist is actively misleading, not just clutter.
+    await env.DB.prepare(`DELETE FROM coach_feedback WHERE goal_id = ? AND feedback_type = 'plan_review'`)
+      .bind(goal.id)
+      .run();
+    await env.DB.prepare(
+      `INSERT INTO coach_feedback (goal_id, feedback_text, feedback_type, plan_adjusted) VALUES (?,?,'plan_review',0)`
+    )
+      .bind(goal.id, coachNote.trim())
+      .run();
+  } catch (e) {
+    // Non-fatal — the plan itself already saved successfully, the coach's note is a bonus
+    console.error("Coach review pass failed (non-fatal):", e.message);
+  }
+
   return plan;
 }
 
 // ---------- Weekly review / adjustment ----------
 
 async function weeklyReview(env, goal) {
+  const today = todayMelbourne();
+  const thisMonday = mondayOf(today);
+  const lastMonday = addDays(thisMonday, -7);
+  const lastSunday = addDays(thisMonday, -1);
+  const upcomingEnd = addDays(thisMonday, 20);
+
   const planned = await env.DB.prepare(
-    `SELECT * FROM training_plan WHERE goal_id = ? AND week_start_date <= date('now') AND week_start_date > date('now', '-7 days')`
+    `SELECT * FROM training_plan WHERE goal_id = ? AND session_date BETWEEN ? AND ?`
   )
-    .bind(goal.id)
+    .bind(goal.id, toYMD(lastMonday), toYMD(lastSunday))
     .all();
 
   const actualRuns = await env.DB.prepare(
-    `SELECT * FROM runs WHERE start_time >= date('now', '-7 days') ORDER BY start_time`
-  ).all();
+    `SELECT * FROM runs WHERE start_time >= ? ORDER BY start_time`
+  )
+    .bind(toYMD(lastMonday))
+    .all();
 
   const upcoming = await env.DB.prepare(
-    `SELECT * FROM training_plan WHERE goal_id = ? AND week_start_date > date('now') ORDER BY week_start_date, day_of_week LIMIT 14`
+    `SELECT * FROM training_plan WHERE goal_id = ? AND session_date > ? AND session_date <= ? ORDER BY session_date`
   )
-    .bind(goal.id)
+    .bind(goal.id, toYMD(today), toYMD(upcomingEnd))
     .all();
 
   const systemPrompt = `You are an experienced running coach reviewing a runner's last 7 days against their plan.
-Respond with ONLY valid JSON:
-{
-  "feedback": "2-4 sentences, direct and specific, written to the runner",
-  "adjustments": [
-    { "training_plan_id": 123, "target_distance_km": 8.0, "target_pace_min_per_km": 6.2, "description": "updated description" }
-  ]
-}
-Only include entries in "adjustments" for sessions that should change based on how the last week went (fatigue, missed sessions, pace drift, faster-than-expected progress). Leave "adjustments" empty if the plan is on track as-is. Be conservative — don't overreact to a single bad or great run.`;
+Write a draft of 2-4 sentences of direct, specific feedback for the runner in "feedback_draft". Only include entries in "adjustments" for sessions that should change based on how the last week went (fatigue, missed sessions, pace drift, faster-than-expected progress). Leave "adjustments" empty if the plan is on track as-is. Be conservative — don't overreact to a single bad or great run.`;
 
   const userPrompt = `Planned sessions this past week:
 ${JSON.stringify(planned.results)}
@@ -169,15 +388,11 @@ ${JSON.stringify(actualRuns.results)}
 Upcoming planned sessions (next 2 weeks, may need adjusting):
 ${JSON.stringify(upcoming.results)}
 
-Review and respond with JSON only.`;
+Review and respond now.`;
 
-  const raw = await callClaude(env, systemPrompt, userPrompt, 2000);
-  let result;
-  try {
-    result = JSON.parse(stripJsonFence(raw));
-  } catch (e) {
-    console.error("Failed to parse review JSON. Raw response was:", raw);
-    throw new Error("Claude returned invalid/incomplete JSON for the review — see raw output in logs");
+  const result = await callWorkersAI(env, systemPrompt, userPrompt, REVIEW_SCHEMA);
+  if (!result || typeof result.feedback_draft !== "string") {
+    throw new Error("Llama returned an empty or malformed weekly review");
   }
 
   for (const adj of result.adjustments || []) {
@@ -188,13 +403,28 @@ Review and respond with JSON only.`;
       .run();
   }
 
+  // Small Claude pass: just polish the draft text itself, not re-analyze the raw data —
+  // tiny input/output, a fraction of a cent, not a full-context call.
+  let finalFeedback = result.feedback_draft;
+  try {
+    finalFeedback = await callClaude(
+      env,
+      "You are a running coach. Rewrite the following draft feedback to be tighter, warmer, and more direct — 2-4 sentences, same substance, better delivery. Return only the rewritten text, nothing else.",
+      result.feedback_draft,
+      250
+    );
+    finalFeedback = finalFeedback.trim();
+  } catch (e) {
+    console.error("Claude polish pass failed (non-fatal, using Llama's draft):", e.message);
+  }
+
   await env.DB.prepare(
-    `INSERT INTO coach_feedback (goal_id, feedback_text, plan_adjusted) VALUES (?,?,?)`
+    `INSERT INTO coach_feedback (goal_id, feedback_text, feedback_type, plan_adjusted) VALUES (?,?,'weekly_review',?)`
   )
-    .bind(goal.id, result.feedback, (result.adjustments || []).length > 0 ? 1 : 0)
+    .bind(goal.id, finalFeedback, (result.adjustments || []).length > 0 ? 1 : 0)
     .run();
 
-  return result;
+  return { feedback: finalFeedback, adjustments: result.adjustments || [] };
 }
 
 // ---------- Route handlers ----------
@@ -212,6 +442,44 @@ function haeDateToIso(dateStr) {
   const m = dateStr.match(/^(\d{4}-\d{2}-\d{2}) (\d{2}:\d{2}:\d{2}) ([+-]\d{2})(\d{2})$/);
   if (!m) return dateStr;
   return `${m[1]}T${m[2]}${m[3]}:${m[4]}`;
+}
+
+const DAY_OFFSET = { MON: 0, TUE: 1, WED: 2, THU: 3, FRI: 4, SAT: 5, SUN: 6 };
+
+// Cloudflare Workers run on UTC. Melbourne is UTC+10/+11, so naively using `new Date()`
+// for "today" would be wrong for part of every morning (Worker still thinks it's
+// yesterday). This returns a Date whose Y/M/D matches Melbourne's actual calendar day.
+function todayMelbourne() {
+  const fmt = new Intl.DateTimeFormat("en-CA", {
+    timeZone: "Australia/Melbourne",
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+  });
+  const parts = fmt.formatToParts(new Date());
+  const y = parts.find((p) => p.type === "year").value;
+  const m = parts.find((p) => p.type === "month").value;
+  const d = parts.find((p) => p.type === "day").value;
+  return new Date(`${y}-${m}-${d}T00:00:00Z`);
+}
+
+function mondayOf(date) {
+  const d = new Date(date);
+  const day = d.getDay(); // 0=Sun..6=Sat
+  const diff = day === 0 ? -6 : 1 - day;
+  d.setDate(d.getDate() + diff);
+  d.setHours(0, 0, 0, 0);
+  return d;
+}
+
+function addDays(date, n) {
+  const d = new Date(date);
+  d.setDate(d.getDate() + n);
+  return d;
+}
+
+function toYMD(date) {
+  return date.toISOString().slice(0, 10);
 }
 
 async function handleIngest(req, env) {
@@ -234,8 +502,10 @@ async function handleIngest(req, env) {
 
     const distanceKm = haeQty(w.distance);
     const durationSec = typeof w.duration === "number" ? Math.round(w.duration) : null;
-    const avgHr = haeQty(w.avgHeartRate);
-    const maxHr = haeQty(w.maxHeartRate);
+    const avgHrRaw = haeQty(w.avgHeartRate);
+    const maxHrRaw = haeQty(w.maxHeartRate);
+    const avgHr = avgHrRaw != null ? Math.round(avgHrRaw) : null;
+    const maxHr = maxHrRaw != null ? Math.round(maxHrRaw) : null;
     const paceMinPerKm =
       distanceKm && distanceKm > 0 && durationSec ? durationSec / 60 / distanceKm : null;
     const startTime = haeDateToIso(w.start);
@@ -256,12 +526,9 @@ async function handleIngest(req, env) {
       if (dayOnly) {
         await env.DB.prepare(
           `UPDATE training_plan SET status = 'completed', run_id = ?
-           WHERE week_start_date <= ? AND status = 'planned'
-           AND date(week_start_date, '+' || (CASE day_of_week
-              WHEN 'MON' THEN 0 WHEN 'TUE' THEN 1 WHEN 'WED' THEN 2 WHEN 'THU' THEN 3
-              WHEN 'FRI' THEN 4 WHEN 'SAT' THEN 5 WHEN 'SUN' THEN 6 END) || ' days') = ?`
+           WHERE session_date = ? AND status = 'planned'`
         )
-          .bind(runId, dayOnly, dayOnly)
+          .bind(runId, dayOnly)
           .run();
       }
     } else {
@@ -279,6 +546,10 @@ async function handleGoalsList(env) {
 
 async function handleGoalCreate(req, env, ctx) {
   const body = await req.json();
+
+  // Only one goal should be active at a time — archive any existing active goals first
+  await env.DB.prepare(`UPDATE goals SET status = 'archived' WHERE status = 'active'`).run();
+
   const result = await env.DB.prepare(
     `INSERT INTO goals (type, target_date, target_time, status, notes) VALUES (?,?,?,?,?)`
   )
@@ -294,19 +565,41 @@ async function handleGoalCreate(req, env, ctx) {
   return json({ ok: true, goal_id: goalId, weeks_generated: plan.weeks.length });
 }
 
+async function handleGoalRegenerate(req, env, goalId) {
+  const body = await req.json().catch(() => ({}));
+  const goal = await env.DB.prepare(`SELECT * FROM goals WHERE id = ?`).bind(goalId).first();
+  if (!goal) return json({ error: "goal not found" }, 404);
+
+  if (typeof body.notes === "string") {
+    await env.DB.prepare(`UPDATE goals SET notes = ? WHERE id = ?`).bind(body.notes, goalId).run();
+    goal.notes = body.notes;
+  }
+
+  const plan = await generatePlan(env, goal);
+  return json({ ok: true, weeks_generated: plan.weeks.length });
+}
+
 async function handlePlanCurrent(env) {
+  const monday = mondayOf(todayMelbourne());
+  const sunday = addDays(monday, 6);
   const plan = await env.DB.prepare(
     `SELECT tp.* FROM training_plan tp
      JOIN goals g ON g.id = tp.goal_id
      WHERE g.status = 'active'
-     AND tp.week_start_date = (
-       SELECT tp2.week_start_date FROM training_plan tp2
-       JOIN goals g2 ON g2.id = tp2.goal_id
-       WHERE g2.status = 'active'
-       ORDER BY ABS(julianday(tp2.week_start_date) - julianday('now'))
-       LIMIT 1
-     )
-     ORDER BY tp.day_of_week`
+     AND tp.session_date BETWEEN ? AND ?
+     ORDER BY tp.session_date`
+  )
+    .bind(toYMD(monday), toYMD(sunday))
+    .all();
+  return json(plan.results);
+}
+
+async function handlePlanFull(env) {
+  const plan = await env.DB.prepare(
+    `SELECT tp.* FROM training_plan tp
+     JOIN goals g ON g.id = tp.goal_id
+     WHERE g.status = 'active'
+     ORDER BY tp.session_date`
   ).all();
   return json(plan.results);
 }
@@ -318,7 +611,10 @@ async function handleRunsList(env) {
 
 async function handleFeedbackList(env) {
   const feedback = await env.DB.prepare(
-    `SELECT * FROM coach_feedback ORDER BY created_at DESC LIMIT 20`
+    `SELECT cf.* FROM coach_feedback cf
+     JOIN goals g ON g.id = cf.goal_id
+     WHERE g.status = 'active'
+     ORDER BY cf.created_at DESC LIMIT 20`
   ).all();
   return json(feedback.results);
 }
@@ -341,7 +637,12 @@ export default {
       if (pathname === "/api/ingest" && req.method === "POST") return await handleIngest(req, env);
       if (pathname === "/api/goals" && req.method === "GET") return await handleGoalsList(env);
       if (pathname === "/api/goals" && req.method === "POST") return await handleGoalCreate(req, env, ctx);
+      if (pathname.match(/^\/api\/goals\/\d+\/regenerate$/) && req.method === "POST") {
+        const goalId = parseInt(pathname.split("/")[3], 10);
+        return await handleGoalRegenerate(req, env, goalId);
+      }
       if (pathname === "/api/plan/current" && req.method === "GET") return await handlePlanCurrent(env);
+      if (pathname === "/api/plan/full" && req.method === "GET") return await handlePlanFull(env);
       if (pathname === "/api/runs" && req.method === "GET") return await handleRunsList(env);
       if (pathname === "/api/feedback" && req.method === "GET") return await handleFeedbackList(env);
       if (pathname === "/api/review/weekly" && req.method === "POST") return await handleReviewTrigger(env);
