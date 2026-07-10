@@ -609,6 +609,76 @@ async function handleRunsList(env) {
   return json(runs.results);
 }
 
+async function handlePBs(env) {
+  const allRuns = await env.DB.prepare(`SELECT * FROM runs ORDER BY start_time ASC`).all();
+  const runs = allRuns.results;
+
+  // PBs are computed from whole runs close to the target distance, with time normalized
+  // to the exact distance via pace — this is how most PB trackers work, and it's what's
+  // actually derivable from whole-run summary data (no lap/split-level GPS data captured yet,
+  // so true "fastest 1km/mile within a longer run" isn't supported).
+  const DISTANCE_TARGETS = [
+    { key: "5k", label: "5K", target: 5, tolerance: 0.08 },
+    { key: "10k", label: "10K", target: 10, tolerance: 0.05 },
+    { key: "half", label: "Half Marathon", target: 21.1, tolerance: 0.03 },
+  ];
+
+  const pbs = DISTANCE_TARGETS.map((d) => {
+    const candidates = runs.filter(
+      (r) =>
+        r.distance_km != null &&
+        r.avg_pace_min_per_km != null &&
+        r.distance_km >= d.target * (1 - d.tolerance) &&
+        r.distance_km <= d.target * (1 + d.tolerance)
+    );
+    if (candidates.length === 0) {
+      return { key: d.key, label: d.label, achieved: false };
+    }
+    const best = candidates.reduce((a, b) => (a.avg_pace_min_per_km < b.avg_pace_min_per_km ? a : b));
+    return {
+      key: d.key,
+      label: d.label,
+      achieved: true,
+      run_id: best.id,
+      date: best.start_time,
+      actual_distance_km: best.distance_km,
+      avg_pace_min_per_km: best.avg_pace_min_per_km,
+      estimated_time_sec: Math.round(best.avg_pace_min_per_km * d.target * 60),
+    };
+  });
+
+  let longestRun = null;
+  for (const r of runs) {
+    if (r.distance_km != null && (!longestRun || r.distance_km > longestRun.distance_km)) {
+      longestRun = r;
+    }
+  }
+
+  const weekTotals = {};
+  for (const r of runs) {
+    if (r.distance_km == null) continue;
+    const wk = toYMD(mondayOf(new Date(r.start_time.slice(0, 10) + "T00:00:00Z")));
+    weekTotals[wk] = (weekTotals[wk] || 0) + r.distance_km;
+  }
+  let bestWeek = null;
+  for (const [wk, km] of Object.entries(weekTotals)) {
+    if (!bestWeek || km > bestWeek.km) bestWeek = { week_start: wk, km };
+  }
+
+  const runDates = new Set(runs.map((r) => r.start_time.slice(0, 10)));
+  let streak = 0;
+  let cursor = todayMelbourne();
+  if (!runDates.has(toYMD(cursor))) {
+    cursor = addDays(cursor, -1); // no run yet today doesn't break an ongoing streak
+  }
+  while (runDates.has(toYMD(cursor))) {
+    streak++;
+    cursor = addDays(cursor, -1);
+  }
+
+  return json({ pbs, longest_run: longestRun, best_week: bestWeek, current_streak: streak });
+}
+
 async function handleFeedbackList(env) {
   const feedback = await env.DB.prepare(
     `SELECT cf.* FROM coach_feedback cf
@@ -645,6 +715,7 @@ export default {
       if (pathname === "/api/plan/full" && req.method === "GET") return await handlePlanFull(env);
       if (pathname === "/api/runs" && req.method === "GET") return await handleRunsList(env);
       if (pathname === "/api/feedback" && req.method === "GET") return await handleFeedbackList(env);
+      if (pathname === "/api/pbs" && req.method === "GET") return await handlePBs(env);
       if (pathname === "/api/review/weekly" && req.method === "POST") return await handleReviewTrigger(env);
 
       return json({ error: "not found" }, 404);

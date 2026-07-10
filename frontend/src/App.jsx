@@ -333,6 +333,56 @@ function FullPlanOverview({ fullPlan, loading }) {
   );
 }
 
+function PBsView({ data, loading }) {
+  if (loading) return <div className="empty-state">Loading personal bests…</div>;
+  if (!data) return <div className="empty-state">No data yet — sync some runs first.</div>;
+
+  const { pbs, longest_run, best_week, current_streak } = data;
+
+  return (
+    <div className="pbs-view">
+      <div className="pbs-stats-row">
+        <div className="pbs-stat">
+          <div className="pbs-stat__value">{current_streak}</div>
+          <div className="pbs-stat__label">day streak</div>
+        </div>
+        <div className="pbs-stat">
+          <div className="pbs-stat__value">{longest_run ? fmtDist(longest_run.distance_km) : "—"}</div>
+          <div className="pbs-stat__label">longest run</div>
+        </div>
+        <div className="pbs-stat">
+          <div className="pbs-stat__value">{best_week ? `${best_week.km.toFixed(1)}km` : "—"}</div>
+          <div className="pbs-stat__label">best week</div>
+        </div>
+      </div>
+
+      <div className="pbs-list">
+        {pbs.map((pb) => (
+          <div key={pb.key} className={`pbs-card ${pb.achieved ? "" : "pbs-card--empty"}`}>
+            <div className="pbs-card__label">{pb.label}</div>
+            {pb.achieved ? (
+              <>
+                <div className="pbs-card__time">{fmtDuration(pb.estimated_time_sec)}</div>
+                <div className="pbs-card__meta">
+                  {fmtPace(pb.avg_pace_min_per_km)} · {new Date(pb.date).toLocaleDateString("en-AU", { day: "numeric", month: "short" })}
+                  {pb.actual_distance_km ? ` · from a ${pb.actual_distance_km.toFixed(1)}km run` : ""}
+                </div>
+              </>
+            ) : (
+              <div className="pbs-card__meta">No qualifying run yet</div>
+            )}
+          </div>
+        ))}
+      </div>
+
+      <div className="pbs-note">
+        PBs are estimated from your closest-distance runs, normalized to the exact distance by pace — not from
+        in-run splits (Trainr doesn't capture GPS lap data yet).
+      </div>
+    </div>
+  );
+}
+
 export default function App() {
   const [goals, setGoals] = useState([]);
   const [plan, setPlan] = useState([]);
@@ -343,6 +393,9 @@ export default function App() {
   const [fullPlan, setFullPlan] = useState([]);
   const [fullPlanLoading, setFullPlanLoading] = useState(false);
   const [fullPlanLoaded, setFullPlanLoaded] = useState(false);
+  const [pbData, setPbData] = useState(null);
+  const [pbLoading, setPbLoading] = useState(false);
+  const [pbLoaded, setPbLoaded] = useState(false);
 
   const loadAll = useCallback(async () => {
     setLoading(true);
@@ -358,6 +411,7 @@ export default function App() {
       setRuns(r);
       setFeedback(f);
       setFullPlanLoaded(false); // force a fresh full-plan fetch next time that tab opens
+      setPbLoaded(false);
     } catch (err) {
       // API likely not deployed yet — leave empty states showing
       console.error(err);
@@ -381,7 +435,17 @@ export default function App() {
         .catch((err) => console.error(err))
         .finally(() => setFullPlanLoading(false));
     }
-  }, [activeTab, fullPlanLoaded]);
+    if (activeTab === "pbs" && !pbLoaded) {
+      setPbLoading(true);
+      api("/pbs")
+        .then((data) => {
+          setPbData(data);
+          setPbLoaded(true);
+        })
+        .catch((err) => console.error(err))
+        .finally(() => setPbLoading(false));
+    }
+  }, [activeTab, fullPlanLoaded, pbLoaded]);
 
   const activeGoal = goals.find((g) => g.status === "active");
 
@@ -406,6 +470,19 @@ export default function App() {
       console.error(err);
     } finally {
       setFullPlanLoading(false);
+    }
+  }, []);
+
+  const refreshPBs = useCallback(async () => {
+    setPbLoading(true);
+    try {
+      const data = await api("/pbs");
+      setPbData(data);
+      setPbLoaded(true);
+    } catch (err) {
+      console.error(err);
+    } finally {
+      setPbLoading(false);
     }
   }, []);
 
@@ -435,9 +512,13 @@ export default function App() {
       setPullDistance((currentDistance) => {
         if (currentDistance > PULL_THRESHOLD) {
           setRefreshing(true);
-          Promise.all([loadAll(), activeTabRef.current === "full" ? refreshFullPlan() : Promise.resolve()]).finally(
-            () => setRefreshing(false)
-          );
+          const tabRefresh =
+            activeTabRef.current === "full"
+              ? refreshFullPlan()
+              : activeTabRef.current === "pbs"
+              ? refreshPBs()
+              : Promise.resolve();
+          Promise.all([loadAll(), tabRefresh]).finally(() => setRefreshing(false));
         }
         return 0;
       });
@@ -451,7 +532,7 @@ export default function App() {
       window.removeEventListener("touchmove", onTouchMove);
       window.removeEventListener("touchend", onTouchEnd);
     };
-  }, [loadAll, refreshFullPlan]);
+  }, [loadAll, refreshFullPlan, refreshPBs]);
 
   return (
     <div className="app">
@@ -479,6 +560,12 @@ export default function App() {
           onClick={() => setActiveTab("full")}
         >
           Full Plan
+        </button>
+        <button
+          className={`tab-nav__btn ${activeTab === "pbs" ? "tab-nav__btn--active" : ""}`}
+          onClick={() => setActiveTab("pbs")}
+        >
+          PBs
         </button>
       </div>
 
@@ -513,10 +600,15 @@ export default function App() {
               <NewGoalForm onCreated={loadAll} />
             </section>
           </>
-        ) : (
+        ) : activeTab === "full" ? (
           <section className="card">
             <h2>Full plan overview</h2>
             <FullPlanOverview fullPlan={fullPlan} loading={fullPlanLoading} />
+          </section>
+        ) : (
+          <section className="card">
+            <h2>Personal bests</h2>
+            <PBsView data={pbData} loading={pbLoading} />
           </section>
         )}
       </main>

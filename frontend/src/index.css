@@ -538,6 +538,79 @@ select:focus-visible {
   }
 }
 
+.pbs-stats-row {
+  display: flex;
+  gap: 10px;
+  margin-bottom: 18px;
+}
+
+.pbs-stat {
+  flex: 1;
+  text-align: center;
+  background: var(--sand-100);
+  border-radius: 10px;
+  padding: 14px 8px;
+}
+
+.pbs-stat__value {
+  font-family: var(--font-display);
+  font-size: 24px;
+  font-weight: 700;
+  color: var(--teal-700);
+}
+
+.pbs-stat__label {
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--ink-600);
+  margin-top: 2px;
+}
+
+.pbs-list {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.pbs-card {
+  border: 1px solid var(--teal-200);
+  border-radius: 10px;
+  padding: 14px;
+}
+
+.pbs-card--empty {
+  opacity: 0.6;
+  border-style: dashed;
+}
+
+.pbs-card__label {
+  font-weight: 700;
+  font-size: 15px;
+  margin-bottom: 4px;
+}
+
+.pbs-card__time {
+  font-family: var(--font-mono);
+  font-size: 26px;
+  font-weight: 600;
+  color: var(--teal-900);
+}
+
+.pbs-card__meta {
+  font-size: 12px;
+  color: var(--ink-600);
+  margin-top: 2px;
+}
+
+.pbs-note {
+  margin-top: 16px;
+  font-size: 11px;
+  color: var(--ink-600);
+  line-height: 1.5;
+  font-style: italic;
+}
+
 /* ---------- Goal form ---------- */
 
 .goal-form {
