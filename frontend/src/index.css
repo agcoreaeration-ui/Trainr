@@ -346,6 +346,11 @@ select:focus-visible {
   color: var(--white);
 }
 
+.coach-card__badge--run_review {
+  background: var(--amber-500);
+  color: var(--white);
+}
+
 .coach-card__text {
   margin: 0;
   font-size: 15px;

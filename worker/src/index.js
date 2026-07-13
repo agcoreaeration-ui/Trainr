@@ -147,6 +147,31 @@ const REVIEW_SCHEMA = {
   required: ["feedback_draft", "adjustments"],
 };
 
+const RUN_COMMENT_SCHEMA = {
+  type: "object",
+  properties: { comment: { type: "string" } },
+  required: ["comment"],
+};
+
+async function generateRunComment(env, run, matchedSession) {
+  const systemPrompt = `You are a supportive, direct running coach. Write one short comment (1-2 sentences) on a single completed run. Compare it to the planned session if one is given. Be specific — reference the actual pace/distance/effort — and honest, not just generic encouragement.`;
+  const sessionContext = matchedSession
+    ? `Planned session: ${matchedSession.session_type}, target ${matchedSession.target_distance_km}km @ ${matchedSession.target_pace_min_per_km} min/km — "${matchedSession.description}"`
+    : `This run wasn't matched to a specific planned session (may be an extra or unplanned run).`;
+  const userPrompt = `Completed run:
+Distance: ${run.distance_km != null ? run.distance_km.toFixed(2) : "?"}km
+Duration: ${run.duration_sec ?? "?"}s
+Avg pace: ${run.avg_pace_min_per_km != null ? run.avg_pace_min_per_km.toFixed(2) : "?"} min/km
+Avg HR: ${run.avg_hr ?? "not recorded"}
+Max HR: ${run.max_hr ?? "not recorded"}
+
+${sessionContext}
+
+Give a short, specific coach's comment on this run now.`;
+  const result = await callWorkersAI(env, systemPrompt, userPrompt, RUN_COMMENT_SCHEMA, 300);
+  return result?.comment ? result.comment.trim() : null;
+}
+
 // ---------- Plan generation ----------
 
 async function generatePlan(env, goal) {
@@ -506,6 +531,21 @@ async function handleIngest(req, env) {
     const maxHrRaw = haeQty(w.maxHeartRate);
     const avgHr = avgHrRaw != null ? Math.round(avgHrRaw) : null;
     const maxHr = maxHrRaw != null ? Math.round(maxHrRaw) : null;
+
+    if (avgHr == null || maxHr == null) {
+      // Temporary diagnostic — log every key on the workout whose name suggests it's
+      // heart-rate related, so we can see the actual field name/shape without guessing.
+      const hrLikeKeys = Object.keys(w).filter((k) => k.toLowerCase().includes("heart"));
+      const hrLikeValues = {};
+      for (const k of hrLikeKeys) hrLikeValues[k] = w[k];
+      console.error(
+        `HR MISSING for workout "${w.name}" (${w.start}): avgHeartRate=${JSON.stringify(
+          w.avgHeartRate
+        )}, maxHeartRate=${JSON.stringify(w.maxHeartRate)}, all HR-like keys:`,
+        JSON.stringify(hrLikeValues).slice(0, 1500)
+      );
+    }
+
     const paceMinPerKm =
       distanceKm && distanceKm > 0 && durationSec ? durationSec / 60 / distanceKm : null;
     const startTime = haeDateToIso(w.start);
@@ -523,13 +563,41 @@ async function handleIngest(req, env) {
       inserted++;
       const runId = result.meta.last_row_id;
       const dayOnly = startTime ? startTime.slice(0, 10) : null;
+      let matchedSession = null;
       if (dayOnly) {
-        await env.DB.prepare(
-          `UPDATE training_plan SET status = 'completed', run_id = ?
-           WHERE session_date = ? AND status = 'planned'`
+        // Only match against the currently active goal's plan — a missing filter here
+        // meant any goal (even archived ones) with a matching session_date could get
+        // marked completed, not just the one actually in use.
+        matchedSession = await env.DB.prepare(
+          `SELECT tp.* FROM training_plan tp
+           JOIN goals g ON g.id = tp.goal_id
+           WHERE g.status = 'active' AND tp.session_date = ? AND tp.status = 'planned'`
         )
-          .bind(runId, dayOnly)
-          .run();
+          .bind(dayOnly)
+          .first();
+        if (matchedSession) {
+          await env.DB.prepare(
+            `UPDATE training_plan SET status = 'completed', run_id = ? WHERE id = ?`
+          )
+            .bind(runId, matchedSession.id)
+            .run();
+        }
+      }
+
+      // Small Workers AI (free) pass: a short coach's comment on this specific run.
+      try {
+        const runRow = await env.DB.prepare(`SELECT * FROM runs WHERE id = ?`).bind(runId).first();
+        const comment = await generateRunComment(env, runRow, matchedSession);
+        if (comment) {
+          const activeGoal = await env.DB.prepare(`SELECT id FROM goals WHERE status = 'active' LIMIT 1`).first();
+          await env.DB.prepare(
+            `INSERT INTO coach_feedback (goal_id, run_id, feedback_text, feedback_type, plan_adjusted) VALUES (?,?,?,'run_review',0)`
+          )
+            .bind(activeGoal?.id ?? null, runId, comment)
+            .run();
+        }
+      } catch (e) {
+        console.error("Run comment generation failed (non-fatal):", e.message);
       }
     } else {
       skipped++; // already existed (duplicate external_id)

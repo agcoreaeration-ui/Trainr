@@ -151,6 +151,7 @@ function RecentRuns({ runs }) {
 const FEEDBACK_TYPE_LABEL = {
   plan_review: "NEW PLAN",
   weekly_review: "WEEK REVIEW",
+  run_review: "RUN NOTE",
 };
 
 function CoachFeedback({ feedback }) {
