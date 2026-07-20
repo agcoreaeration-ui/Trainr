@@ -302,6 +302,15 @@ select:focus-visible {
   padding-bottom: 4px;
 }
 
+.runs-list__extra {
+  display: flex;
+  gap: 14px;
+  padding: 4px 4px 10px;
+  font-size: 12px;
+  color: var(--ink-600);
+  font-family: var(--font-mono);
+}
+
 /* ---------- Coach card ---------- */
 
 .coach-feed {
@@ -404,6 +413,26 @@ select:focus-visible {
   background: #fdf6ec;
 }
 
+.full-plan__week--current {
+  border-color: var(--teal-700);
+  border-width: 2px;
+  background: var(--lime-100);
+}
+
+.full-plan__current-badge {
+  display: inline-block;
+  margin-left: 6px;
+  font-family: var(--font-mono);
+  font-size: 9px;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  background: var(--lime-400);
+  color: var(--teal-900);
+  border-radius: 4px;
+  padding: 1px 5px;
+  vertical-align: middle;
+}
+
 .full-plan__week-header {
   display: flex;
   align-items: baseline;
@@ -481,6 +510,11 @@ select:focus-visible {
 
 .full-plan__pill--selected {
   box-shadow: 0 0 0 2px var(--teal-700);
+}
+
+.full-plan__pill--done {
+  opacity: 0.55;
+  font-size: 13px;
 }
 
 .full-plan__detail {
@@ -614,6 +648,85 @@ select:focus-visible {
   color: var(--ink-600);
   line-height: 1.5;
   font-style: italic;
+}
+
+.plan-stats,
+.plan-history {
+  margin-top: 20px;
+  padding-top: 16px;
+  border-top: 1px solid var(--sand-100);
+}
+
+.plan-stats__title {
+  font-weight: 700;
+  font-size: 14px;
+  text-transform: capitalize;
+  margin-bottom: 10px;
+}
+
+.plan-stats__row {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  gap: 8px;
+}
+
+.plan-stats__item {
+  text-align: center;
+  background: var(--sand-100);
+  border-radius: 8px;
+  padding: 10px 4px;
+}
+
+.plan-stats__value {
+  font-family: var(--font-mono);
+  font-size: 16px;
+  font-weight: 700;
+  color: var(--teal-700);
+}
+
+.plan-stats__label {
+  font-size: 9px;
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+  color: var(--ink-600);
+  margin-top: 2px;
+}
+
+.plan-history__table {
+  display: flex;
+  flex-direction: column;
+}
+
+.plan-history__row {
+  display: grid;
+  grid-template-columns: 1.6fr 0.7fr 0.7fr;
+  gap: 6px;
+  padding: 8px 2px;
+  font-size: 12px;
+  border-bottom: 1px solid var(--sand-100);
+  align-items: center;
+}
+
+.plan-history__row--header {
+  font-family: var(--font-mono);
+  font-size: 9px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--ink-600);
+}
+
+.plan-history__row:not(.plan-history__row--header) div:first-child {
+  text-transform: capitalize;
+  font-weight: 600;
+}
+
+.plan-history__started {
+  font-family: var(--font-mono);
+  font-size: 10px;
+  font-weight: 400;
+  text-transform: none;
+  color: var(--ink-600);
+  margin-top: 1px;
 }
 
 /* ---------- Goal form ---------- */

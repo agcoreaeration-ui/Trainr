@@ -119,6 +119,7 @@ function WeekPlan({ sessions }) {
 }
 
 function RecentRuns({ runs }) {
+  const [selectedId, setSelectedId] = useState(null);
   if (runs.length === 0) {
     return <div className="empty-state">No runs synced yet — check your Shortcuts automation is running.</div>;
   }
@@ -132,18 +133,38 @@ function RecentRuns({ runs }) {
         <div>AVG HR</div>
         <div>MAX HR</div>
       </div>
-      {runs.slice(0, 8).map((r) => (
-        <div key={r.id} className="runs-list__row">
-          <div className="runs-list__date">
-            {new Date(r.start_time).toLocaleDateString("en-AU", { day: "numeric", month: "short" })}
-          </div>
-          <div className="runs-list__dist">{fmtDist(r.distance_km)}</div>
-          <div className="runs-list__pace">{fmtPace(r.avg_pace_min_per_km)}</div>
-          <div className="runs-list__time">{fmtDuration(r.duration_sec)}</div>
-          <div className="runs-list__hr">{r.avg_hr ?? "—"}</div>
-          <div className="runs-list__hr">{r.max_hr ?? "—"}</div>
-        </div>
-      ))}
+      {runs.slice(0, 8).map((r) => {
+        const hasExtra = r.temperature != null || r.humidity != null || r.elevation_gain != null;
+        return (
+          <React.Fragment key={r.id}>
+            <div
+              className="runs-list__row"
+              onClick={() => hasExtra && setSelectedId(selectedId === r.id ? null : r.id)}
+              style={hasExtra ? { cursor: "pointer" } : undefined}
+            >
+              <div className="runs-list__date">
+                {new Date(r.start_time).toLocaleDateString("en-AU", { day: "numeric", month: "short" })}
+              </div>
+              <div className="runs-list__dist">{fmtDist(r.distance_km)}</div>
+              <div className="runs-list__pace">{fmtPace(r.avg_pace_min_per_km)}</div>
+              <div className="runs-list__time">{fmtDuration(r.duration_sec)}</div>
+              <div className="runs-list__hr">{r.avg_hr ?? "—"}</div>
+              <div className="runs-list__hr">{r.max_hr ?? "—"}</div>
+            </div>
+            {selectedId === r.id && hasExtra && (
+              <div className="runs-list__extra">
+                {r.temperature != null && (
+                  <span>🌡️ {Math.round(r.temperature)}°{r.temperature_units === "degF" ? "F" : "C"}</span>
+                )}
+                {r.humidity != null && <span>💧 {Math.round(r.humidity)}%</span>}
+                {r.elevation_gain != null && (
+                  <span>⛰️ {Math.round(r.elevation_gain)}{r.elevation_units || "m"} gain</span>
+                )}
+              </div>
+            )}
+          </React.Fragment>
+        );
+      })}
     </div>
   );
 }
@@ -263,6 +284,10 @@ function FullPlanOverview({ fullPlan, loading }) {
     return <div className="empty-state">No plan generated yet — set a goal to build one.</div>;
   }
 
+  // Local calendar date, not UTC (toISOString() would shift this in Melbourne).
+  const now = new Date();
+  const todayStr = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, "0")}-${String(now.getDate()).padStart(2, "0")}`;
+
   const byWeek = {};
   for (const s of fullPlan) {
     if (!byWeek[s.week_number]) byWeek[s.week_number] = [];
@@ -281,6 +306,8 @@ function FullPlanOverview({ fullPlan, loading }) {
         const totalKm = sessions.reduce((sum, s) => sum + (s.target_distance_km || 0), 0);
         const longRun = Math.max(0, ...sessions.map((s) => (s.session_type === "long" ? s.target_distance_km : 0)));
         const hasRace = sessions.some((s) => s.session_type === "race");
+        const dates = sessions.map((s) => s.session_date).filter(Boolean).sort();
+        const isCurrentWeek = dates.length > 0 && todayStr >= dates[0] && todayStr <= dates[dates.length - 1];
         const firstDate = sessions[0]?.session_date;
         const weekLabel = firstDate
           ? new Date(firstDate).toLocaleDateString("en-AU", { day: "numeric", month: "short" })
@@ -288,9 +315,17 @@ function FullPlanOverview({ fullPlan, loading }) {
         const selectedSession = sessions.find((s) => s.id === selectedId);
 
         return (
-          <div key={wn} className={`full-plan__week ${hasRace ? "full-plan__week--race" : ""}`}>
+          <div
+            key={wn}
+            className={`full-plan__week ${hasRace ? "full-plan__week--race" : ""} ${
+              isCurrentWeek ? "full-plan__week--current" : ""
+            }`}
+          >
             <div className="full-plan__week-header">
-              <span className="full-plan__week-num">Week {wn}</span>
+              <span className="full-plan__week-num">
+                Week {wn}
+                {isCurrentWeek && <span className="full-plan__current-badge">NOW</span>}
+              </span>
               <span className="full-plan__week-date">{weekLabel}</span>
               <span className="full-plan__week-stats">
                 {totalKm.toFixed(1)}km · long {longRun.toFixed(1)}km
@@ -303,13 +338,13 @@ function FullPlanOverview({ fullPlan, loading }) {
                   type="button"
                   className={`full-plan__pill full-plan__pill--${s.session_type} ${
                     selectedId === s.id ? "full-plan__pill--selected" : ""
-                  }`}
+                  } ${s.status === "completed" ? "full-plan__pill--done" : ""}`}
                   title={`${s.day_of_week}: ${SESSION_LABEL[s.session_type] || s.session_type}${
                     s.target_distance_km ? ` (${s.target_distance_km}km)` : ""
-                  }`}
+                  }${s.status === "completed" ? " — completed" : ""}`}
                   onClick={() => setSelectedId(selectedId === s.id ? null : s.id)}
                 >
-                  {s.day_of_week[0]}
+                  {s.status === "completed" ? "✓" : s.day_of_week[0]}
                 </button>
               ))}
             </div>
@@ -338,7 +373,8 @@ function PBsView({ data, loading }) {
   if (loading) return <div className="empty-state">Loading personal bests…</div>;
   if (!data) return <div className="empty-state">No data yet — sync some runs first.</div>;
 
-  const { pbs, longest_run, best_week, current_streak } = data;
+  const { pbs, longest_run, best_week, current_streak, plan_stats, plan_history } = data;
+  const active = plan_stats?.active;
 
   return (
     <div className="pbs-view">
@@ -375,6 +411,62 @@ function PBsView({ data, loading }) {
           </div>
         ))}
       </div>
+
+      {active && (
+        <div className="plan-stats">
+          <div className="plan-stats__title">This plan — {active.goal_type}</div>
+          <div className="plan-stats__row">
+            <div className="plan-stats__item">
+              <div className="plan-stats__value">{active.days_elapsed}</div>
+              <div className="plan-stats__label">days elapsed</div>
+            </div>
+            <div className="plan-stats__item">
+              <div className="plan-stats__value">{active.days_remaining ?? "—"}</div>
+              <div className="plan-stats__label">days to go</div>
+            </div>
+            <div className="plan-stats__item">
+              <div className="plan-stats__value">{active.total_km.toFixed(1)}</div>
+              <div className="plan-stats__label">km run</div>
+            </div>
+            <div className="plan-stats__item">
+              <div className="plan-stats__value">
+                {active.sessions_completed}/{active.sessions_total}
+              </div>
+              <div className="plan-stats__label">sessions done</div>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {plan_history && plan_history.length > 0 && (
+        <div className="plan-history">
+          <div className="plan-stats__title">Previous plans</div>
+          <div className="plan-history__table">
+            <div className="plan-history__row plan-history__row--header">
+              <div>Plan</div>
+              <div>KM</div>
+              <div>Sessions</div>
+            </div>
+            {plan_history.map((h) => (
+              <div key={h.goal_id} className="plan-history__row">
+                <div>
+                  <div>
+                    {h.type}
+                    {h.target_date ? ` · ${new Date(h.target_date).toLocaleDateString("en-AU", { day: "numeric", month: "short", year: "2-digit" })}` : ""}
+                  </div>
+                  <div className="plan-history__started">
+                    started {new Date(h.created_at).toLocaleDateString("en-AU", { day: "numeric", month: "short" })}
+                  </div>
+                </div>
+                <div>{h.total_km.toFixed(1)}km</div>
+                <div>
+                  {h.sessions_completed}/{h.sessions_total}
+                </div>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
 
       <div className="pbs-note">
         PBs are estimated from your closest-distance runs, normalized to the exact distance by pace — not from
@@ -438,9 +530,9 @@ export default function App() {
     }
     if (activeTab === "pbs" && !pbLoaded) {
       setPbLoading(true);
-      api("/pbs")
-        .then((data) => {
-          setPbData(data);
+      Promise.all([api("/pbs"), api("/plan-stats"), api("/plan-history")])
+        .then(([pbs, planStats, planHistory]) => {
+          setPbData({ ...pbs, plan_stats: planStats, plan_history: planHistory });
           setPbLoaded(true);
         })
         .catch((err) => console.error(err))
@@ -477,8 +569,8 @@ export default function App() {
   const refreshPBs = useCallback(async () => {
     setPbLoading(true);
     try {
-      const data = await api("/pbs");
-      setPbData(data);
+      const [pbs, planStats, planHistory] = await Promise.all([api("/pbs"), api("/plan-stats"), api("/plan-history")]);
+      setPbData({ ...pbs, plan_stats: planStats, plan_history: planHistory });
       setPbLoaded(true);
     } catch (err) {
       console.error(err);

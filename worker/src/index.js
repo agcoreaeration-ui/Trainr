@@ -154,16 +154,23 @@ const RUN_COMMENT_SCHEMA = {
 };
 
 async function generateRunComment(env, run, matchedSession) {
-  const systemPrompt = `You are a supportive, direct running coach. Write one short comment (1-2 sentences) on a single completed run. Compare it to the planned session if one is given. Be specific — reference the actual pace/distance/effort — and honest, not just generic encouragement.`;
+  const systemPrompt = `You are a supportive, direct running coach. Write one short comment (1-2 sentences) on a single completed run. Compare it to the planned session if one is given. If weather or elevation data is notably tough (hot, humid, hilly), you can factor that in — but don't force a mention if conditions were unremarkable. Be specific — reference the actual pace/distance/effort — and honest, not just generic encouragement.`;
   const sessionContext = matchedSession
     ? `Planned session: ${matchedSession.session_type}, target ${matchedSession.target_distance_km}km @ ${matchedSession.target_pace_min_per_km} min/km — "${matchedSession.description}"`
     : `This run wasn't matched to a specific planned session (may be an extra or unplanned run).`;
+  const conditionsParts = [];
+  if (run.temperature != null) conditionsParts.push(`temperature ${run.temperature}°${run.temperature_units === "degF" ? "F" : "C"}`);
+  if (run.humidity != null) conditionsParts.push(`humidity ${run.humidity}${run.humidity_units === "%" ? "%" : ""}`);
+  if (run.elevation_gain != null) conditionsParts.push(`elevation gain ${run.elevation_gain}${run.elevation_units || "m"}`);
+  const conditionsContext = conditionsParts.length > 0 ? `Conditions: ${conditionsParts.join(", ")}.` : "";
+
   const userPrompt = `Completed run:
 Distance: ${run.distance_km != null ? run.distance_km.toFixed(2) : "?"}km
 Duration: ${run.duration_sec ?? "?"}s
 Avg pace: ${run.avg_pace_min_per_km != null ? run.avg_pace_min_per_km.toFixed(2) : "?"} min/km
 Avg HR: ${run.avg_hr ?? "not recorded"}
 Max HR: ${run.max_hr ?? "not recorded"}
+${conditionsContext}
 
 ${sessionContext}
 
@@ -461,6 +468,15 @@ function haeQty(field) {
   return null;
 }
 
+function haeQtyWithUnits(field) {
+  if (field == null) return { value: null, units: null };
+  if (typeof field === "number") return { value: field, units: null };
+  if (typeof field === "object" && typeof field.qty === "number") {
+    return { value: field.qty, units: typeof field.units === "string" ? field.units : null };
+  }
+  return { value: null, units: null };
+}
+
 function haeDateToIso(dateStr) {
   // "2026-07-01 13:13:46 +1000" -> "2026-07-01T13:13:46+10:00"
   if (!dateStr) return null;
@@ -551,12 +567,42 @@ async function handleIngest(req, env) {
     const startTime = haeDateToIso(w.start);
     const externalId = w.id || null;
 
+    const elevation = haeQtyWithUnits(w.elevationUp);
+    const temperature = haeQtyWithUnits(w.temperature);
+    const humidity = haeQtyWithUnits(w.humidity);
+
+    if (elevation.value != null || temperature.value != null) {
+      // Temporary diagnostic — confirm actual units Health Auto Export is sending,
+      // rather than assuming metric/Celsius (we got burned assuming HR shape once already).
+      console.error(
+        `WEATHER/ELEVATION for "${w.name}" (${w.start}): elevation=${JSON.stringify(
+          w.elevationUp
+        )}, temperature=${JSON.stringify(w.temperature)}, humidity=${JSON.stringify(w.humidity)}`
+      );
+    }
+
     const result = await env.DB.prepare(
       `INSERT OR IGNORE INTO runs
-       (start_time, duration_sec, distance_km, avg_pace_min_per_km, avg_hr, max_hr, splits_json, external_id)
-       VALUES (?,?,?,?,?,?,?,?)`
+       (start_time, duration_sec, distance_km, avg_pace_min_per_km, avg_hr, max_hr, splits_json, external_id,
+        elevation_gain, elevation_units, temperature, temperature_units, humidity, humidity_units)
+       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)`
     )
-      .bind(startTime, durationSec, distanceKm, paceMinPerKm, avgHr, maxHr, "[]", externalId)
+      .bind(
+        startTime,
+        durationSec,
+        distanceKm,
+        paceMinPerKm,
+        avgHr,
+        maxHr,
+        "[]",
+        externalId,
+        elevation.value,
+        elevation.units,
+        temperature.value,
+        temperature.units,
+        humidity.value,
+        humidity.units
+      )
       .run();
 
     if (result.meta.changes > 0) {
@@ -677,6 +723,94 @@ async function handleRunsList(env) {
   return json(runs.results);
 }
 
+async function handlePlanStats(env) {
+  const goal = await env.DB.prepare(`SELECT * FROM goals WHERE status = 'active' LIMIT 1`).first();
+  if (!goal) return json({ active: null });
+
+  const created = new Date(goal.created_at.replace(" ", "T") + "Z");
+  const today = todayMelbourne();
+  const daysElapsed = Math.max(0, Math.floor((today - created) / (24 * 60 * 60 * 1000)));
+
+  let daysRemaining = null;
+  if (goal.target_date) {
+    const target = new Date(goal.target_date + "T00:00:00Z");
+    daysRemaining = Math.round((target - today) / (24 * 60 * 60 * 1000));
+  }
+
+  const allRuns = await env.DB.prepare(`SELECT distance_km, start_time FROM runs`).all();
+  const runsSinceGoal = allRuns.results.filter((r) => new Date(r.start_time) >= created);
+  const totalKm = runsSinceGoal.reduce((sum, r) => sum + (r.distance_km || 0), 0);
+
+  const sessionsCount = await env.DB.prepare(
+    `SELECT
+       SUM(CASE WHEN status = 'completed' THEN 1 ELSE 0 END) as completed,
+       COUNT(*) as total
+     FROM training_plan WHERE goal_id = ?`
+  )
+    .bind(goal.id)
+    .first();
+
+  return json({
+    active: {
+      goal_type: goal.type,
+      target_date: goal.target_date,
+      days_elapsed: daysElapsed,
+      days_remaining: daysRemaining,
+      total_km: totalKm,
+      run_count: runsSinceGoal.length,
+      sessions_completed: sessionsCount.completed || 0,
+      sessions_total: sessionsCount.total || 0,
+    },
+  });
+}
+
+async function handlePlanHistory(env) {
+  const goals = await env.DB.prepare(`SELECT * FROM goals WHERE status = 'archived' ORDER BY created_at ASC`).all();
+  const allGoals = await env.DB.prepare(`SELECT id, created_at FROM goals ORDER BY created_at ASC`).all();
+  const runs = await env.DB.prepare(`SELECT distance_km, start_time FROM runs ORDER BY start_time ASC`).all();
+
+  const history = [];
+  for (const g of goals.results) {
+    const windowStart = new Date(g.created_at.replace(" ", "T") + "Z");
+    const next = allGoals.results.find((x) => x.id !== g.id && x.created_at > g.created_at);
+    let windowEnd = next ? new Date(next.created_at.replace(" ", "T") + "Z") : null;
+    if (g.target_date) {
+      const targetEnd = new Date(g.target_date + "T23:59:59Z");
+      if (!windowEnd || targetEnd < windowEnd) windowEnd = targetEnd;
+    }
+
+    const totalKm = runs.results
+      .filter((r) => {
+        const t = new Date(r.start_time);
+        return t >= windowStart && (!windowEnd || t <= windowEnd);
+      })
+      .reduce((sum, r) => sum + (r.distance_km || 0), 0);
+
+    const sessionsCount = await env.DB.prepare(
+      `SELECT SUM(CASE WHEN status = 'completed' THEN 1 ELSE 0 END) as completed, COUNT(*) as total
+       FROM training_plan WHERE goal_id = ?`
+    )
+      .bind(g.id)
+      .first();
+
+    history.push({
+      goal_id: g.id,
+      type: g.type,
+      target_date: g.target_date,
+      created_at: g.created_at,
+      total_km: totalKm,
+      sessions_completed: sessionsCount.completed || 0,
+      sessions_total: sessionsCount.total || 0,
+    });
+  }
+
+  // Filter out empty test/duplicate goals from development — no runs and nothing
+  // ever completed means there's no meaningful history to show for that goal.
+  const meaningful = history.filter((h) => h.total_km > 0 || h.sessions_completed > 0);
+
+  return json(meaningful.reverse()); // most recent first
+}
+
 async function handlePBs(env) {
   const allRuns = await env.DB.prepare(`SELECT * FROM runs ORDER BY start_time ASC`).all();
   const runs = allRuns.results;
@@ -784,6 +918,8 @@ export default {
       if (pathname === "/api/runs" && req.method === "GET") return await handleRunsList(env);
       if (pathname === "/api/feedback" && req.method === "GET") return await handleFeedbackList(env);
       if (pathname === "/api/pbs" && req.method === "GET") return await handlePBs(env);
+      if (pathname === "/api/plan-stats" && req.method === "GET") return await handlePlanStats(env);
+      if (pathname === "/api/plan-history" && req.method === "GET") return await handlePlanHistory(env);
       if (pathname === "/api/review/weekly" && req.method === "POST") return await handleReviewTrigger(env);
 
       return json({ error: "not found" }, 404);

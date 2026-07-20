@@ -37,6 +37,12 @@ CREATE TABLE IF NOT EXISTS runs (
   splits_json TEXT,                -- raw split data from Shortcuts, JSON array
   source TEXT DEFAULT 'apple_health',
   external_id TEXT UNIQUE,         -- Health Auto Export's workout UUID, prevents duplicate inserts
+  elevation_gain REAL,
+  elevation_units TEXT,
+  temperature REAL,
+  temperature_units TEXT,
+  humidity REAL,
+  humidity_units TEXT,
   created_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
@@ -44,8 +50,9 @@ CREATE TABLE IF NOT EXISTS coach_feedback (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   goal_id INTEGER REFERENCES goals(id),
   week_number INTEGER,
+  run_id INTEGER REFERENCES runs(id),
   feedback_text TEXT NOT NULL,
-  feedback_type TEXT NOT NULL DEFAULT 'weekly_review', -- 'plan_review' or 'weekly_review'
+  feedback_type TEXT NOT NULL DEFAULT 'weekly_review', -- 'plan_review', 'weekly_review', or 'run_review'
   plan_adjusted INTEGER DEFAULT 0, -- boolean
   created_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
