@@ -118,7 +118,43 @@ function WeekPlan({ sessions }) {
   );
 }
 
-function RecentRuns({ runs }) {
+function RunNotesEditor({ run, onSaved }) {
+  const [text, setText] = useState(run.notes || "");
+  const [saving, setSaving] = useState(false);
+  const [saved, setSaved] = useState(false);
+
+  const save = async () => {
+    setSaving(true);
+    setSaved(false);
+    try {
+      await api(`/runs/${run.id}/notes`, { method: "POST", body: JSON.stringify({ notes: text }) });
+      setSaved(true);
+      onSaved(run.id, text);
+      setTimeout(() => setSaved(false), 2000);
+    } catch (err) {
+      console.error(err);
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  return (
+    <div className="run-notes">
+      <textarea
+        className="run-notes__input"
+        placeholder="Add a note — injury niggles, how it felt, conditions… (the coach reads these)"
+        value={text}
+        onChange={(e) => setText(e.target.value)}
+        rows={2}
+      />
+      <button type="button" className="run-notes__save" onClick={save} disabled={saving || text === (run.notes || "")}>
+        {saving ? "Saving…" : saved ? "Saved ✓" : "Save note"}
+      </button>
+    </div>
+  );
+}
+
+function RecentRuns({ runs, onNoteSaved }) {
   const [selectedId, setSelectedId] = useState(null);
   if (runs.length === 0) {
     return <div className="empty-state">No runs synced yet — check your Shortcuts automation is running.</div>;
@@ -134,16 +170,17 @@ function RecentRuns({ runs }) {
         <div>MAX HR</div>
       </div>
       {runs.slice(0, 8).map((r) => {
-        const hasExtra = r.temperature != null || r.humidity != null || r.elevation_gain != null;
+        const hasConditions = r.temperature != null || r.humidity != null || r.elevation_gain != null;
         return (
           <React.Fragment key={r.id}>
             <div
               className="runs-list__row"
-              onClick={() => hasExtra && setSelectedId(selectedId === r.id ? null : r.id)}
-              style={hasExtra ? { cursor: "pointer" } : undefined}
+              onClick={() => setSelectedId(selectedId === r.id ? null : r.id)}
+              style={{ cursor: "pointer" }}
             >
               <div className="runs-list__date">
                 {new Date(r.start_time).toLocaleDateString("en-AU", { day: "numeric", month: "short" })}
+                {r.notes ? <span className="runs-list__note-dot" title="Has a note">●</span> : null}
               </div>
               <div className="runs-list__dist">{fmtDist(r.distance_km)}</div>
               <div className="runs-list__pace">{fmtPace(r.avg_pace_min_per_km)}</div>
@@ -151,15 +188,20 @@ function RecentRuns({ runs }) {
               <div className="runs-list__hr">{r.avg_hr ?? "—"}</div>
               <div className="runs-list__hr">{r.max_hr ?? "—"}</div>
             </div>
-            {selectedId === r.id && hasExtra && (
-              <div className="runs-list__extra">
-                {r.temperature != null && (
-                  <span>🌡️ {Math.round(r.temperature)}°{r.temperature_units === "degF" ? "F" : "C"}</span>
+            {selectedId === r.id && (
+              <div className="runs-list__detail">
+                {hasConditions && (
+                  <div className="runs-list__extra">
+                    {r.temperature != null && (
+                      <span>🌡️ {Math.round(r.temperature)}°{r.temperature_units === "degF" ? "F" : "C"}</span>
+                    )}
+                    {r.humidity != null && <span>💧 {Math.round(r.humidity)}%</span>}
+                    {r.elevation_gain != null && (
+                      <span>⛰️ {Math.round(r.elevation_gain)}{r.elevation_units || "m"} gain</span>
+                    )}
+                  </div>
                 )}
-                {r.humidity != null && <span>💧 {Math.round(r.humidity)}%</span>}
-                {r.elevation_gain != null && (
-                  <span>⛰️ {Math.round(r.elevation_gain)}{r.elevation_units || "m"} gain</span>
-                )}
+                <RunNotesEditor run={r} onSaved={onNoteSaved} />
               </div>
             )}
           </React.Fragment>
@@ -685,7 +727,12 @@ export default function App() {
 
             <section className="card">
               <h2>Recent runs</h2>
-              <RecentRuns runs={runs} />
+              <RecentRuns
+                runs={runs}
+                onNoteSaved={(runId, notes) =>
+                  setRuns((prev) => prev.map((r) => (r.id === runId ? { ...r, notes } : r)))
+                }
+              />
             </section>
 
             <section className="card">

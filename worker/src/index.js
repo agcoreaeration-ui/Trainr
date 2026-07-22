@@ -207,7 +207,7 @@ async function generatePlan(env, goal) {
 
   // Pull recent run history for context on current fitness
   const recentRuns = await env.DB.prepare(
-    `SELECT start_time, distance_km, avg_pace_min_per_km, avg_hr
+    `SELECT start_time, distance_km, avg_pace_min_per_km, avg_hr, notes
      FROM runs ORDER BY start_time DESC LIMIT 20`
   ).all();
 
@@ -409,12 +409,13 @@ async function weeklyReview(env, goal) {
     .all();
 
   const systemPrompt = `You are an experienced running coach reviewing a runner's last 7 days against their plan.
-Write a draft of 2-4 sentences of direct, specific feedback for the runner in "feedback_draft". Only include entries in "adjustments" for sessions that should change based on how the last week went (fatigue, missed sessions, pace drift, faster-than-expected progress). Leave "adjustments" empty if the plan is on track as-is. Be conservative — don't overreact to a single bad or great run.`;
+Write a draft of 2-4 sentences of direct, specific feedback for the runner in "feedback_draft". Only include entries in "adjustments" for sessions that should change based on how the last week went (fatigue, missed sessions, pace drift, faster-than-expected progress). Leave "adjustments" empty if the plan is on track as-is. Be conservative — don't overreact to a single bad or great run.
+IMPORTANT: runs may include a "notes" field written by the runner themselves — treat these as high-priority context. If any note mentions pain, injury, soreness, or a physical concern, address it directly in your feedback and err strongly toward reducing load or adding recovery in the adjustments, rather than pushing through. Never ignore an injury mention.`;
 
   const userPrompt = `Planned sessions this past week:
 ${JSON.stringify(planned.results)}
 
-Actual runs completed this past week:
+Actual runs completed this past week (including the runner's own notes where present):
 ${JSON.stringify(actualRuns.results)}
 
 Upcoming planned sessions (next 2 weeks, may need adjusting):
@@ -718,6 +719,15 @@ async function handlePlanFull(env) {
   return json(plan.results);
 }
 
+async function handleRunNote(req, env, runId) {
+  const body = await req.json().catch(() => ({}));
+  if (typeof body.notes !== "string") return json({ error: "notes (string) required" }, 400);
+  const run = await env.DB.prepare(`SELECT id FROM runs WHERE id = ?`).bind(runId).first();
+  if (!run) return json({ error: "run not found" }, 404);
+  await env.DB.prepare(`UPDATE runs SET notes = ? WHERE id = ?`).bind(body.notes.trim() || null, runId).run();
+  return json({ ok: true });
+}
+
 async function handleRunsList(env) {
   const runs = await env.DB.prepare(`SELECT * FROM runs ORDER BY start_time DESC LIMIT 50`).all();
   return json(runs.results);
@@ -916,6 +926,10 @@ export default {
       if (pathname === "/api/plan/current" && req.method === "GET") return await handlePlanCurrent(env);
       if (pathname === "/api/plan/full" && req.method === "GET") return await handlePlanFull(env);
       if (pathname === "/api/runs" && req.method === "GET") return await handleRunsList(env);
+      if (pathname.match(/^\/api\/runs\/\d+\/notes$/) && req.method === "POST") {
+        const runId = parseInt(pathname.split("/")[3], 10);
+        return await handleRunNote(req, env, runId);
+      }
       if (pathname === "/api/feedback" && req.method === "GET") return await handleFeedbackList(env);
       if (pathname === "/api/pbs" && req.method === "GET") return await handlePBs(env);
       if (pathname === "/api/plan-stats" && req.method === "GET") return await handlePlanStats(env);

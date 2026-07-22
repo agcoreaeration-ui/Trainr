@@ -311,6 +311,58 @@ select:focus-visible {
   font-family: var(--font-mono);
 }
 
+.runs-list__detail {
+  padding: 2px 2px 12px;
+  border-bottom: 1px solid var(--sand-100);
+}
+
+.runs-list__note-dot {
+  color: var(--lime-500, #8fc94f);
+  font-size: 8px;
+  margin-left: 4px;
+  vertical-align: middle;
+}
+
+.run-notes {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin-top: 4px;
+}
+
+.run-notes__input {
+  width: 100%;
+  box-sizing: border-box;
+  border: 1px solid var(--teal-200);
+  border-radius: 8px;
+  padding: 8px 10px;
+  font-family: var(--font-body);
+  font-size: 13px;
+  resize: vertical;
+  background: var(--white);
+  color: var(--ink-900);
+}
+
+.run-notes__input:focus {
+  outline: none;
+  border-color: var(--teal-700);
+}
+
+.run-notes__save {
+  align-self: flex-end;
+  border: none;
+  background: var(--teal-700);
+  color: var(--white);
+  font-size: 12px;
+  font-weight: 600;
+  padding: 6px 14px;
+  border-radius: 7px;
+}
+
+.run-notes__save:disabled {
+  opacity: 0.5;
+}
+
 /* ---------- Coach card ---------- */
 
 .coach-feed {

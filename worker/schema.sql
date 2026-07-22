@@ -43,6 +43,7 @@ CREATE TABLE IF NOT EXISTS runs (
   temperature_units TEXT,
   humidity REAL,
   humidity_units TEXT,
+  notes TEXT,                      -- user's own comments: injury concerns, how it felt, conditions
   created_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
